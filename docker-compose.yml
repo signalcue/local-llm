@@ -1,0 +1,41 @@
+name: llm-gateway
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: llm-gateway-redis
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  llm-gateway:
+    build:
+      context: ./adapter
+    container_name: llm-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      MODEL_NAME: ${MODEL_NAME:-qwq:32b}
+      PARALLEL_MODE: ${PARALLEL_MODE:-true}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_API_URL: ${ANTHROPIC_API_URL:-https://api.anthropic.com/v1/messages}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-180}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-14}
+      OLLAMA_TEMPERATURE: ${OLLAMA_TEMPERATURE:-0.1}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-8192}
+      OLLAMA_NUM_PREDICT: ${OLLAMA_NUM_PREDICT:-1024}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  redis-data:
