@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 app = FastAPI(title="SharpCue Local LLM Adapter")
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434").rstrip("/")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5-coder:32b")
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5-coder:32b").strip()
 PARALLEL_MODE = os.getenv("PARALLEL_MODE", "true").lower() == "true"
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -26,6 +26,10 @@ ENV_NAME = os.getenv("ENV_NAME", "dev")
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1024"))
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "1"))
+LOCK_TO_CONFIGURED_MODEL = os.getenv("LOCK_TO_CONFIGURED_MODEL", "true").lower() == "true"
+
+REQUEST_SEMAPHORE = asyncio.Semaphore(max(1, MAX_CONCURRENT_REQUESTS))
 
 
 def _now() -> int:
@@ -64,10 +68,16 @@ def _to_ollama_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def _resolve_local_model(requested_model: Any) -> str:
+    if LOCK_TO_CONFIGURED_MODEL:
+        return MODEL_NAME
+
     if not isinstance(requested_model, str) or not requested_model.strip():
         return MODEL_NAME
 
     normalized = requested_model.strip().lower()
+    if normalized in {"local", "local-llm", "ollama"}:
+        return MODEL_NAME
+
     # Anthropic-compatible callers will send Claude model ids that Ollama cannot load.
     # Route those requests to the configured local model transparently.
     if normalized.startswith("claude"):
@@ -172,81 +182,102 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "parallel_mode": PARALLEL_MODE,
         "model": MODEL_NAME,
+        "max_concurrent_requests": max(1, MAX_CONCURRENT_REQUESTS),
+        "lock_to_configured_model": LOCK_TO_CONFIGURED_MODEL,
         "ollama_host": OLLAMA_HOST,
     }
 
 
 @app.post("/v1/messages")
 async def messages(request: Request) -> JSONResponse:
-    request_id = request.headers.get("x-request-id") or f"req_{uuid.uuid4().hex[:20]}"
-    request_start = time.monotonic()
-    payload = await request.json()
-    requested_model = str(payload.get("model") or MODEL_NAME)
-    local_model = _resolve_local_model(requested_model)
-    source_hint = _extract_market_hint(payload, request)
+    async with REQUEST_SEMAPHORE:
+        request_id = request.headers.get("x-request-id") or f"req_{uuid.uuid4().hex[:20]}"
+        request_start = time.monotonic()
+        payload = await request.json()
+        requested_model = str(payload.get("model") or MODEL_NAME)
+        local_model = _resolve_local_model(requested_model)
+        source_hint = _extract_market_hint(payload, request)
 
-    ollama_messages = _to_ollama_messages(payload)
-    if not ollama_messages:
-        raise HTTPException(status_code=400, detail="No messages provided")
+        ollama_messages = _to_ollama_messages(payload)
+        if not ollama_messages:
+            raise HTTPException(status_code=400, detail="No messages provided")
 
-    ollama_payload = {
-        "model": local_model,
-        "messages": ollama_messages,
-        "stream": False,
-        "format": "json",
-        "options": {
-            "temperature": OLLAMA_TEMPERATURE,
-            "num_ctx": OLLAMA_NUM_CTX,
-            "num_predict": OLLAMA_NUM_PREDICT,
-        },
-    }
+        requested_max_tokens = payload.get("max_tokens")
+        try:
+            requested_max_tokens = int(requested_max_tokens) if requested_max_tokens is not None else None
+        except (TypeError, ValueError):
+            requested_max_tokens = None
 
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            resp = await client.post(f"{OLLAMA_HOST}/api/chat", json=ollama_payload)
-            resp.raise_for_status()
-            ollama_data = resp.json()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Ollama request failed: {exc}") from exc
+        # Prefer caller max_tokens when provided; otherwise use gateway default.
+        # Keep a hard bound for safety under long responses.
+        effective_num_predict = requested_max_tokens if (requested_max_tokens and requested_max_tokens > 0) else OLLAMA_NUM_PREDICT
+        effective_num_predict = max(128, min(4096, int(effective_num_predict)))
 
-    content = ((ollama_data.get("message") or {}).get("content") or "").strip()
-    # Strip <think>...</think> blocks emitted by reasoning models (e.g. qwq, deepseek-r1)
-    # before the JSON payload so downstream parsers see clean output.
-    import re as _re
-    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
-    prompt_tokens = int(ollama_data.get("prompt_eval_count") or 0)
-    completion_tokens = int(ollama_data.get("eval_count") or 0)
-    local_latency_ms = int((time.monotonic() - request_start) * 1000)
+        ollama_payload = {
+            "model": local_model,
+            "messages": ollama_messages,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": OLLAMA_TEMPERATURE,
+                "num_ctx": OLLAMA_NUM_CTX,
+                "num_predict": effective_num_predict,
+            },
+        }
 
-    anthropic_response = {
-        "id": f"msg_local_{uuid.uuid4().hex[:20]}",
-        "type": "message",
-        "role": "assistant",
-        "model": requested_model or local_model,
-        "content": [{"type": "text", "text": content}],
-        "stop_reason": "end_turn",
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": prompt_tokens,
-            "output_tokens": completion_tokens,
-        },
-    }
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                resp = await client.post(f"{OLLAMA_HOST}/api/chat", json=ollama_payload)
+                resp.raise_for_status()
+                ollama_data = resp.json()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Ollama request failed: {exc}; "
+                    f"requested_model={requested_model!r}; "
+                    f"resolved_local_model={local_model!r}"
+                ),
+            ) from exc
 
-    if PARALLEL_MODE:
-        asyncio.create_task(
-            _call_claude_and_log(
-                original_payload=payload,
-                local_response=anthropic_response,
-                request_id=request_id,
-                requested_model=requested_model,
-                local_model=local_model,
-                local_latency_ms=local_latency_ms,
-                local_tokens={
-                    "input_tokens": prompt_tokens,
-                    "output_tokens": completion_tokens,
-                },
-                source_hint=source_hint,
+        content = ((ollama_data.get("message") or {}).get("content") or "").strip()
+        # Strip <think>...</think> blocks emitted by reasoning models (e.g. qwq, deepseek-r1)
+        # before the JSON payload so downstream parsers see clean output.
+        import re as _re
+        content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+        prompt_tokens = int(ollama_data.get("prompt_eval_count") or 0)
+        completion_tokens = int(ollama_data.get("eval_count") or 0)
+        local_latency_ms = int((time.monotonic() - request_start) * 1000)
+
+        anthropic_response = {
+            "id": f"msg_local_{uuid.uuid4().hex[:20]}",
+            "type": "message",
+            "role": "assistant",
+            "model": requested_model or local_model,
+            "content": [{"type": "text", "text": content}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+            },
+        }
+
+        if PARALLEL_MODE:
+            asyncio.create_task(
+                _call_claude_and_log(
+                    original_payload=payload,
+                    local_response=anthropic_response,
+                    request_id=request_id,
+                    requested_model=requested_model,
+                    local_model=local_model,
+                    local_latency_ms=local_latency_ms,
+                    local_tokens={
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": completion_tokens,
+                    },
+                    source_hint=source_hint,
+                )
             )
-        )
 
-    return JSONResponse(content=anthropic_response)
+        return JSONResponse(content=anthropic_response)
